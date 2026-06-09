@@ -1,0 +1,64 @@
+[analysis]
+mode = "single_basin"
+
+[sweep]
+parameter = "w"
+min_value = 0.2
+max_value = 1.7
+num_values = 50
+
+[model]
+state_names = ["x", "v", "U"]
+equations = [
+  "v",
+  "-d * v - r1 * U + 0.5 * x - 0.5 * x^3 + F0 * cos(w * t)",
+  "r2 * v - r3 * U",
+]
+parameter_names = ["w", "F0", "d", "r1", "r2", "r3"]
+parameter_values = [0.3, 0.1, 0.0105, 0.13, 0.24, 0.55]
+state_defaults = [0.0, 0.0, 0.0]
+
+[initial_condition_plane]
+x_state = "x"
+y_state = "v"
+x_min = -2.5
+x_max = 2.5
+y_min = -1.0
+y_max = 1.0
+grid_mode = "auto"
+n_target = 1000
+nx = 50
+ny = 25
+
+[integration]
+device = "gpu"
+precision = "Float32"
+solver_mode = "fixed"
+solver = "Tsit5"
+period_mode = "periodic"
+custom_time_argument = "time"
+period_expression = "2*pi/w"
+transient_periods = 300.0
+evaluation_periods = 5.0
+samples_per_period = 500
+t_transient = 2000.0
+t_evaluation = 20.9439510239
+dt = 0.0418879020479
+save_dt = 0.0418879020479
+streaming_chunk_periods = 10.0
+abstol = 1.0e-9
+reltol = 1.0e-7
+
+[classification]
+observable_state = "x"
+zero_cross_state = "v"
+fingerprint_tol = 1.0e-2
+fingerprint_k = 4
+extrema_eps = 1.0e-4
+max_extrema = 12
+
+[output]
+run_name = "duffing_default"
+write_labels_csv = true
+write_basin_image = true
+write_sweep_details = true
