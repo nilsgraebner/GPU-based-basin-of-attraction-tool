@@ -91,15 +91,17 @@ There are two main variants:
 - **Stage B RK4 extrema**: Stage A is computed by the standard GPU solver. Stage B is computed by a CUDA RK4 kernel that returns extrema.
 - **Stage A+B RK4 extrema**: Both transient integration and extrema detection are performed by CUDA RK4 kernels.
 
-For the built-in Duffing model, hand-written kernels are used. These kernels keep the forcing phase wrapped internally, which avoids loss of Float32 precision for long physical times.
+For the built-in Duffing model, hand-written kernels are still available internally for compatibility with older configurations. The GUI exposes the generated custom Stage A+B path instead, so the same solver setup can be used for both the standard model and user-defined systems.
 
-For custom models, the backend validates the expressions and generates a specialized CUDA RHS and RK4 kernel for the selected state and parameter names. This currently supports 2 to 8 states and Float32 GPU runs.
+For generated Stage A+B kernels, the backend validates the expressions and generates a specialized CUDA RHS and RK4 kernel for the selected state and parameter names. This currently supports 2 to 8 states and Float32 or Float64 GPU runs.
 
 ## Phase Mode For Periodic Forcing
 
 Long integrations in Float32 can lose resolution when the forcing is evaluated as `cos(w*t)` with very large `t`. For periodic forcing, the RK4 phase mode advances a wrapped phase in `[0, 2*pi)` and evaluates the forcing from that phase.
 
-For custom RK4 phase mode, the user may keep the equation as `cos(w*t)` when `period_expression = 2*pi/w`. The backend rewrites the product `w*t` to the wrapped internal `phase` before generating the runtime ODE function and CUDA kernel.
+For custom RK4 phase mode, the user may keep the equation as `cos(w*t)` when `period_expression = 2*pi/w`. The backend rewrites the product `w*t` to the wrapped internal `phase` before generating the runtime ODE function and CUDA kernel. Periodic custom Stage A+B RK4 runs select this wrapped phase form automatically when every physical-time occurrence can be rewritten safely; otherwise the explicitly configured time mode is kept.
+
+Representative phase trajectories are selected from the most frequent classes, not from the lowest numeric labels. The GUI can then filter those saved trajectories by minimum class fraction without recomputing the ODE integrations; the same filter is used during sweep video export.
 
 ## Parameter Sweeps
 
