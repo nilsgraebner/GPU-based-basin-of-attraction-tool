@@ -39,12 +39,15 @@ SWEEP_MAX_CLASSES_DEFAULT = "50"
 SWEEP_MAX_POINTS_DEFAULT = "1000000"
 SWEEP_COLOR_MODE_DEFAULT = "Feature"
 SWEEP_POINT_SIZE_DEFAULT = 0.9
+PHASE_MIN_FRACTION_DEFAULT = "0.0"
 EXPORT_IMAGE_SIZE = (1000, 720)
 VIDEO_FRAME_SIZE = (1920, 1080)
 VIDEO_HEADER_HEIGHT = 360
 VIDEO_MARGIN = 36
 VIDEO_PANEL_GAP = 24
 VIDEO_FPS = 24
+VIDEO_INTRO_SECONDS = 5
+VIDEO_INTRO_FRAMES = VIDEO_FPS * VIDEO_INTRO_SECONDS
 JULIA_LOG_FRAME_TRANSLATION = str.maketrans(
     {
         "\u2500": "-",
@@ -86,6 +89,14 @@ SOLVER_SETUPS = [
         "description": "Fastest standard GPU path. Uses fixed-step Tsit5 and stores the evaluation window for classification and phase plotting.",
     },
     {
+        "label": "GPU accurate - Float64 fixed Tsit5",
+        "device": "gpu",
+        "precision": "Float64",
+        "solver_mode": "fixed",
+        "solver": "Tsit5",
+        "description": "Standard GPU fixed-step Tsit5 path with Float64. Slower and more memory intensive than Float32, but useful for precision checks when the GPU supports Float64.",
+    },
+    {
         "label": "GPU memory saver - Float32 streaming extrema",
         "device": "gpu",
         "precision": "Float32",
@@ -102,20 +113,20 @@ SOLVER_SETUPS = [
         "description": "Experimental fused CUDA path: Stage A uses GPU Tsit5, Stage B uses a custom fixed-step RK4 kernel that detects extrema directly on the GPU. The built-in Duffing model keeps its phase-wrapped optimized path; custom GPU-safe ODEs with 2 to 8 states use the generic RK4 kernel.",
     },
     {
-        "label": "GPU RK4 extrema Stage A+B - Float32",
-        "device": "gpu",
-        "precision": "Float32",
-        "solver_mode": "rk4_full_extrema",
-        "solver": "Tsit5",
-        "description": "Experimental all-RK4 CUDA path for the built-in Duffing model only. Uses the hand-optimized phase-wrapped Duffing kernel for transient integration and direct extrema detection on the GPU.",
-    },
-    {
         "label": "GPU RK4 extrema Stage A+B Custom - Float32",
         "device": "gpu",
         "precision": "Float32",
         "solver_mode": "rk4_full_extrema_custom",
         "solver": "Tsit5",
-        "description": "Experimental all-RK4 CUDA path for custom GPU-safe ODEs with 2 to 8 states. Generates a specialized CUDA RHS and RK4 kernel from the model equations, then detects extrema directly on the GPU. With Custom Time Arg = phase, expressions like cos(w*t) are kept in the model editor but w*t is replaced by wrapped phase internally.",
+        "description": "Experimental all-RK4 CUDA path for GPU-safe ODEs with 2 to 8 states, including the standard Duffing model. Generates a specialized CUDA RHS and RK4 kernel from the model equations, then detects extrema directly on the GPU.",
+    },
+    {
+        "label": "GPU RK4 extrema Stage A+B Custom - Float64",
+        "device": "gpu",
+        "precision": "Float64",
+        "solver_mode": "rk4_full_extrema_custom",
+        "solver": "Tsit5",
+        "description": "Same generated all-RK4 CUDA A+B path as the custom Float32 setup, but with Float64 state integration on GPUs that support double precision.",
     },
     {
         "label": "CPU fast - Float32 fixed Tsit5",
@@ -290,7 +301,7 @@ PARAM_HELP = {
     "solver_mode": "fixed uses a constant time step; streaming_extrema uses fixed-step integration but collects only extrema during the evaluation window; rk4_extrema uses a fused CUDA RK4 Stage-B kernel; rk4_full_extrema is the optimized built-in Duffing A+B kernel; rk4_full_extrema_custom generates a specialized A+B CUDA kernel for custom GPU-safe ODEs with 2 to 8 states; adaptive lets the CPU solver choose steps from error tolerances.",
     "solver": "Time integrator used by the backend. GPU currently supports Tsit5 only; CPU supports the listed solvers.",
     "period_mode": "periodic computes times from a forcing period; direct_time uses the explicit time and step fields.",
-    "custom_time_argument": "For custom RK4 A+B only: time passes physical t to the generated RHS; phase passes a wrapped phase variable from 0 to 2*pi. In phase mode you may keep expressions such as F0*cos(w*t) when Period Expression is 2*pi/w; internally w*t is replaced by phase.",
+    "custom_time_argument": "For custom RK4 A+B only: time passes physical t to the generated RHS; phase passes a wrapped phase variable from 0 to 2*pi. In phase mode you may keep expressions such as F0*cos(w*t) when Period Expression is 2*pi/w; internally w*t is replaced by phase. Periodic custom A+B runs use phase automatically when the forcing can be rewritten safely.",
     "period_expression": "Julia expression for one forcing period, evaluated with the current parameters. The default 2*pi/w follows the harmonic forcing.",
     "transient_periods": "Number of forcing periods integrated and discarded before classification in periodic mode.",
     "evaluation_periods": "Number of forcing periods recorded after the transient for extrema classification and phase plotting.",
@@ -402,10 +413,12 @@ class BasinGuiApp(tk.Tk):
         self.basin_zoom_history: list[dict[str, str]] = []
         self.phase_series: list[dict] = []
         self.phase_bounds: tuple[float, float, float, float] | None = None
+        self.class_fractions: dict[int, float] = {}
         self.sweep_points: list[dict] = []
         self.sweep_points_total = 0
         self.sweep_bounds: tuple[float, float, float, float] | None = None
         self.sweep_feature_colors_by_value: dict[float, dict[int, str]] = {}
+        self.sweep_class_fractions_by_value: dict[float, dict[int, float]] = {}
         self.sweep_details: list[dict] = []
         self.selected_sweep_value: float | None = None
         self.sweep_min_fraction_var = tk.StringVar(value=SWEEP_MIN_FRACTION_DEFAULT)
@@ -413,6 +426,8 @@ class BasinGuiApp(tk.Tk):
         self.sweep_max_points_var = tk.StringVar(value=SWEEP_MAX_POINTS_DEFAULT)
         self.sweep_color_mode_var = tk.StringVar(value=SWEEP_COLOR_MODE_DEFAULT)
         self.sweep_point_size_var = tk.DoubleVar(value=SWEEP_POINT_SIZE_DEFAULT)
+        self.phase_min_fraction_var = tk.StringVar(value=PHASE_MIN_FRACTION_DEFAULT)
+        self.phase_filter_status_label: ttk.Label | None = None
         self.sweep_filter_status_label: ttk.Label | None = None
         self.sweep_point_size_label: ttk.Label | None = None
         self._sweep_redraw_after_id: str | None = None
@@ -537,7 +552,7 @@ class BasinGuiApp(tk.Tk):
         ttk.Button(action_frame, text="Load Defaults", command=lambda: self.load_config(DEFAULT_CONFIG_PATH)).pack(side="left", padx=(0, 8))
         ttk.Button(action_frame, text="Load Config", command=self.load_config_dialog).pack(side="left", padx=(0, 8))
         ttk.Button(action_frame, text="Save Config", command=self.save_config_dialog).pack(side="left", padx=(0, 8))
-        ttk.Button(action_frame, text="Load Latest Result", command=self.load_latest_result).pack(side="left", padx=(0, 8))
+        ttk.Button(action_frame, text="Load Results", command=self.load_result_dialog).pack(side="left", padx=(0, 8))
         ttk.Button(action_frame, text="Open Result Folder", command=self.open_result_dir).pack(side="left", padx=(0, 8))
         ttk.Button(action_frame, text="Restart Julia", command=self.restart_backend).pack(side="left")
 
@@ -586,6 +601,15 @@ class BasinGuiApp(tk.Tk):
         self.basin_canvas.bind("<Configure>", lambda _event: self._redraw_basin_canvas())
         self._bind_basin_recompute_zoom(self.basin_canvas)
 
+        phase_controls = ttk.Frame(phase_tab)
+        phase_controls.pack(anchor="w", fill="x", pady=(0, 6))
+        ttk.Label(phase_controls, text="Min class fraction").pack(side="left")
+        phase_min_entry = ttk.Entry(phase_controls, textvariable=self.phase_min_fraction_var, width=8)
+        phase_min_entry.pack(side="left", padx=(4, 8))
+        ttk.Button(phase_controls, text="Redraw", command=self._redraw_phase_canvas).pack(side="left")
+        self.phase_filter_status_label = ttk.Label(phase_controls, text="", foreground="#555555")
+        self.phase_filter_status_label.pack(side="left", padx=(10, 0))
+        phase_min_entry.bind("<Return>", lambda _event: self._redraw_phase_canvas())
         self.phase_info = ttk.Label(phase_tab, text="No phase data loaded yet.")
         self.phase_info.pack(anchor="w", pady=(0, 6))
         self.phase_canvas = tk.Canvas(phase_tab, background="#ffffff", highlightthickness=0)
@@ -809,11 +833,16 @@ class BasinGuiApp(tk.Tk):
         self.solver_setup_description_label.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         parent.columnconfigure(1, weight=1)
 
-    def _on_solver_setup_changed(self) -> None:
+    def _on_solver_setup_changed(self, *, sync_time_argument: bool = True) -> None:
         setup = SOLVER_SETUP_BY_LABEL.get(self.vars["solver_setup"].get())
         if setup:
             for key in ("device", "precision", "solver_mode", "solver"):
                 self.vars[key].set(setup[key])
+            if sync_time_argument:
+                if setup["solver_mode"] == "rk4_full_extrema_custom":
+                    self.vars["custom_time_argument"].set("phase")
+                elif self.vars["custom_time_argument"].get() == "phase":
+                    self.vars["custom_time_argument"].set("time")
         self._update_solver_setup_description()
 
     def _solver_setup_label_for_fields(self, device: str, precision: str, solver_mode: str, solver: str) -> str:
@@ -1419,7 +1448,7 @@ class BasinGuiApp(tk.Tk):
         if analysis_mode not in {"single_basin", "parameter_sweep", "inspection"}:
             raise ValueError("Analysis mode must be single_basin, parameter_sweep, or inspection.")
 
-        self._on_solver_setup_changed()
+        self._on_solver_setup_changed(sync_time_argument=False)
         device = self.vars["device"].get().strip()
         precision = self.vars["precision"].get().strip()
         solver_mode = self.vars["solver_mode"].get().strip()
@@ -1441,15 +1470,17 @@ class BasinGuiApp(tk.Tk):
         if device == "gpu" and solver != "Tsit5":
             raise ValueError("GPU supports Tsit5 only.")
         if solver_mode in {"rk4_extrema", "rk4_full_extrema", "rk4_full_extrema_custom"}:
-            if device != "gpu" or precision != "Float32" or solver != "Tsit5":
-                raise ValueError("RK4 extrema solver setups require GPU, Float32, and Tsit5.")
+            if device != "gpu" or solver != "Tsit5":
+                raise ValueError("RK4 extrema solver setups require GPU and Tsit5.")
+            if solver_mode in {"rk4_extrema", "rk4_full_extrema"} and precision != "Float32":
+                raise ValueError("The Stage-B RK4 and optimized built-in A+B RK4 setups currently require Float32.")
+            if solver_mode == "rk4_full_extrema_custom" and precision not in {"Float32", "Float64"}:
+                raise ValueError("The custom RK4 A+B setup requires Float32 or Float64.")
             if not 2 <= len(state_names) <= 8:
                 raise ValueError("GPU fused RK4 extrema currently supports custom ODEs with 2 to 8 states.")
             is_default_duffing = matches_default_duffing_config(state_names, parameter_names, equations)
             if solver_mode == "rk4_full_extrema" and not is_default_duffing:
                 raise ValueError("GPU RK4 Stage A+B is the optimized built-in Duffing path. Select 'GPU RK4 extrema Stage A+B Custom - Float32' for custom models.")
-            if solver_mode == "rk4_full_extrema_custom" and is_default_duffing:
-                raise ValueError("The custom RK4 A+B solver is for custom models. Select 'GPU RK4 extrema Stage A+B - Float32' for the built-in Duffing model.")
         uses_phase_symbol = any(re.search(r"(?<![\d.])\bphase\b", equation) for equation in equations)
         if uses_phase_symbol and custom_time_argument != "phase":
             raise ValueError("Equations using 'phase' require Custom Time Arg = phase.")
@@ -1872,6 +1903,8 @@ class BasinGuiApp(tk.Tk):
         class_stats_raw = paths.get("class_stats_csv", "")
         class_stats_path = Path(class_stats_raw) if class_stats_raw else None
         self.current_label_feature_colors = {}
+        self.class_fractions = {}
+        self.sweep_class_fractions_by_value = {}
 
         lines = [f"Run directory: {summary['run']['run_dir']}", f"Analysis mode: {mode}"]
         if mode == "parameter_sweep":
@@ -1951,6 +1984,7 @@ class BasinGuiApp(tk.Tk):
             self.selected_sweep_value = None
             self.current_label_feature_colors = {}
             self.sweep_feature_colors_by_value = {}
+            self.sweep_class_fractions_by_value = self._load_sweep_class_fractions(class_stats_path) if class_stats_path and class_stats_path.is_file() else {}
             self.basin_info.configure(text="Click the sweep plot to load the saved basin for that parameter value.")
             self.phase_info.configure(text="Click the sweep plot to load representative phase trajectories.")
             self.sweep_details = self._load_sweep_details(sweep_details_csv) if sweep_details_csv and sweep_details_csv.is_file() else []
@@ -1984,6 +2018,7 @@ class BasinGuiApp(tk.Tk):
         self.sweep_info.configure(text="No sweep data loaded for this single-basin result.")
         if class_stats_path and class_stats_path.is_file():
             self.current_label_feature_colors = self._load_class_feature_colors(class_stats_path)
+            self.class_fractions = self._load_class_fractions(class_stats_path)
 
         if labels_csv and labels_csv.is_file():
             self.basin_rows = self._load_label_rows(labels_csv)
@@ -2009,18 +2044,39 @@ class BasinGuiApp(tk.Tk):
 
         if phase_samples_csv and phase_samples_csv.is_file():
             self.phase_series, self.phase_bounds = self._load_phase_series(phase_samples_csv)
+            self._annotate_phase_series(self.phase_series, self.class_fractions)
             phase_meta = summary.get("phase", {})
             x_state = phase_meta.get("x_state", "x")
             y_state = phase_meta.get("y_state", "y")
+            shown = len(self._phase_series_for_display())
             self.phase_info.configure(
-                text=f"Source: {phase_samples_csv} | Axes: {x_state} / {y_state} | Trajectories: {len(self.phase_series)}"
+                text=f"Source: {phase_samples_csv} | Axes: {x_state} / {y_state} | Trajectories: {shown}/{len(self.phase_series)}"
             )
             self._redraw_phase_canvas()
         else:
             self.phase_series = []
             self.phase_bounds = None
             self.phase_canvas.delete("all")
+            self._update_phase_filter_status(0, 0)
             self.phase_info.configure(text="No phase plot available. Recompute the result with the current backend version.")
+
+    def load_result_dialog(self) -> None:
+        runs_dir = BASE_DIR / "runs"
+        initial_dir = runs_dir if runs_dir.exists() else BASE_DIR
+        path_raw = filedialog.askopenfilename(
+            title="Load Result Summary",
+            initialdir=str(initial_dir),
+            filetypes=[("TOML files", "*.toml"), ("All files", "*.*")],
+        )
+        if not path_raw:
+            return
+        try:
+            self.basin_zoom_history.clear()
+            summary_path = Path(path_raw)
+            self.load_results(summary_path)
+            self._append_log(f"Result loaded: {summary_path}")
+        except Exception as exc:
+            self._handle_gui_error("Result could not be loaded", exc)
 
     def load_latest_result(self) -> None:
         summaries = sorted(
@@ -2069,6 +2125,91 @@ class BasinGuiApp(tk.Tk):
                 if all(0 <= value <= 255 for value in (red, green, blue)):
                     colors[label] = f"#{red:02x}{green:02x}{blue:02x}"
         return colors
+
+    def _load_class_fractions(self, class_stats_csv: Path) -> dict[int, float]:
+        fractions: dict[int, float] = {}
+        with class_stats_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or [])
+            if not {"label", "fraction"}.issubset(fieldnames) or "parameter_value" in fieldnames:
+                return fractions
+            for row in reader:
+                try:
+                    fractions[int(float(row["label"]))] = float(row["fraction"])
+                except (TypeError, ValueError):
+                    continue
+        return fractions
+
+    def _load_sweep_class_fractions(self, class_stats_csv: Path) -> dict[float, dict[int, float]]:
+        fractions_by_value: dict[float, dict[int, float]] = {}
+        with class_stats_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or [])
+            if not {"parameter_value", "label", "fraction"}.issubset(fieldnames):
+                return fractions_by_value
+            for row in reader:
+                try:
+                    parameter_value = float(row["parameter_value"])
+                    label = int(float(row["label"]))
+                    fraction = float(row["fraction"])
+                except (TypeError, ValueError):
+                    continue
+                fractions_by_value.setdefault(parameter_value, {})[label] = fraction
+        return fractions_by_value
+
+    def _class_fractions_for_sweep_value(self, parameter_value: float) -> dict[int, float]:
+        if not self.sweep_class_fractions_by_value:
+            return {}
+        nearest_value = min(self.sweep_class_fractions_by_value, key=lambda value: abs(value - parameter_value))
+        return dict(self.sweep_class_fractions_by_value.get(nearest_value, {}))
+
+    @staticmethod
+    def _class_fractions_for_sweep_value_map(fractions_by_value: dict[float, dict[int, float]], parameter_value: float) -> dict[int, float]:
+        if not fractions_by_value:
+            return {}
+        nearest_value = min(fractions_by_value, key=lambda value: abs(value - parameter_value))
+        return dict(fractions_by_value.get(nearest_value, {}))
+
+    @staticmethod
+    def _annotate_phase_series(series: list[dict], class_fractions: dict[int, float]) -> None:
+        for item in series:
+            label = int(item.get("label", 0))
+            item["class_fraction"] = class_fractions.get(label, item.get("class_fraction", 1.0))
+
+    def _phase_min_fraction(self) -> float:
+        try:
+            return max(0.0, float(self.phase_min_fraction_var.get().strip() or PHASE_MIN_FRACTION_DEFAULT))
+        except ValueError:
+            return float(PHASE_MIN_FRACTION_DEFAULT)
+
+    def _phase_series_for_display(self, series: list[dict] | None = None, *, min_fraction: float | None = None) -> list[dict]:
+        source = self.phase_series if series is None else series
+        threshold = self._phase_min_fraction() if min_fraction is None else max(0.0, float(min_fraction))
+        return [item for item in source if float(item.get("class_fraction", 1.0)) >= threshold]
+
+    @staticmethod
+    def _phase_bounds_for_series(series: list[dict]) -> tuple[float, float, float, float] | None:
+        xmin = ymin = float("inf")
+        xmax = ymax = float("-inf")
+        for item in series:
+            for x, y in item.get("points", []):
+                xmin = min(xmin, x)
+                xmax = max(xmax, x)
+                ymin = min(ymin, y)
+                ymax = max(ymax, y)
+        if not math.isfinite(xmin) or not math.isfinite(ymin):
+            return None
+        if xmin == xmax:
+            xmin -= 1.0
+            xmax += 1.0
+        if ymin == ymax:
+            ymin -= 1.0
+            ymax += 1.0
+        return xmin, xmax, ymin, ymax
+
+    def _update_phase_filter_status(self, displayed: int, total: int) -> None:
+        if self.phase_filter_status_label is not None:
+            self.phase_filter_status_label.configure(text=f"shown {displayed}/{total} | min frac {self._phase_min_fraction():g}")
 
     def _load_phase_series(self, phase_samples_csv: Path) -> tuple[list[dict], tuple[float, float, float, float] | None]:
         if phase_samples_csv.suffix.lower() == ".bin":
@@ -2571,6 +2712,20 @@ class BasinGuiApp(tk.Tk):
             return
         canvas.delete("all")
         if not self.phase_series or self.phase_bounds is None:
+            self._update_phase_filter_status(0, 0)
+            return
+        display_series = self._phase_series_for_display()
+        display_bounds = self._phase_bounds_for_series(display_series)
+        self._update_phase_filter_status(len(display_series), len(self.phase_series))
+        if not display_series or display_bounds is None:
+            canvas.create_text(
+                max(canvas.winfo_width(), 1) / 2,
+                max(canvas.winfo_height(), 1) / 2,
+                text="No phase trajectories meet the current minimum class fraction.",
+                fill="#555555",
+                font=("Segoe UI", 10),
+                anchor="center",
+            )
             return
 
         width = max(canvas.winfo_width(), 1)
@@ -2581,7 +2736,7 @@ class BasinGuiApp(tk.Tk):
         margin_bottom = 36
         plot_w = max(width - margin_left - margin_right, 1)
         plot_h = max(height - margin_top - margin_bottom, 1)
-        xmin, xmax, ymin, ymax = self.phase_bounds
+        xmin, xmax, ymin, ymax = display_bounds
         pad_x = 0.04 * (xmax - xmin)
         pad_y = 0.04 * (ymax - ymin)
         xmin -= pad_x
@@ -2612,7 +2767,7 @@ class BasinGuiApp(tk.Tk):
             canvas.create_line(x, margin_top, x, margin_top + plot_h, fill="#eeeeee")
             canvas.create_line(margin_left, y, margin_left + plot_w, y, fill="#eeeeee")
 
-        for item in self.phase_series:
+        for item in display_series:
             points = item["points"]
             if len(points) < 2:
                 continue
@@ -2826,10 +2981,12 @@ class BasinGuiApp(tk.Tk):
         self._redraw_basin_canvas()
 
         self.phase_series, self.phase_bounds = self._load_phase_series(detail["phase_samples_csv"])
+        self._annotate_phase_series(self.phase_series, self._class_fractions_for_sweep_value(self.selected_sweep_value))
+        shown = len(self._phase_series_for_display())
         self.phase_info.configure(
             text=(
                 f"Sweep value {self.selected_sweep_value:.8g} | "
-                f"Representative trajectories: {len(self.phase_series)}"
+                f"Representative trajectories: {shown}/{len(self.phase_series)}"
             )
         )
         self._redraw_phase_canvas()
@@ -3061,11 +3218,14 @@ class BasinGuiApp(tk.Tk):
         feature_mode: bool | None = None,
         x_label: str | None = None,
         y_label: str | None = None,
+        min_fraction: float | None = None,
     ):
         series = self.phase_series if series is None else series
         bounds = self.phase_bounds if bounds is None else bounds
+        display_series = self._phase_series_for_display(series, min_fraction=min_fraction)
+        display_bounds = self._phase_bounds_for_series(display_series) or bounds
         feature_colors = self.current_label_feature_colors if feature_colors is None else feature_colors
-        if not series or bounds is None:
+        if not display_series or display_bounds is None:
             return self._render_placeholder_image(width, height, title, "No phase data loaded")
 
         image = Image.new("RGB", (width, height), "white")
@@ -3075,7 +3235,7 @@ class BasinGuiApp(tk.Tk):
         margin_right = 24
         margin_bottom = 58
         margin_left, margin_top, plot_w, plot_h = self._square_plot_layout(width, height, margin_left, margin_top, margin_right, margin_bottom)
-        xmin, xmax, ymin, ymax = bounds
+        xmin, xmax, ymin, ymax = display_bounds
         pad_x = 0.04 * (xmax - xmin)
         pad_y = 0.04 * (ymax - ymin)
         view = (xmin - pad_x, xmax + pad_x, ymin - pad_y, ymax + pad_y)
@@ -3088,7 +3248,7 @@ class BasinGuiApp(tk.Tk):
                 margin_top + (ymax - y_value) / (ymax - ymin) * plot_h,
             )
 
-        for item in series:
+        for item in display_series:
             points = item["points"]
             if len(points) < 2:
                 continue
@@ -3501,6 +3661,158 @@ class BasinGuiApp(tk.Tk):
         )
         draw.line([(0, VIDEO_HEADER_HEIGHT - 1), (VIDEO_FRAME_SIZE[0], VIDEO_HEADER_HEIGHT - 1)], fill="#dddddd", width=1)
 
+    @staticmethod
+    def _format_video_value(value) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, float):
+            return f"{value:.8g}"
+        if isinstance(value, int):
+            return str(value)
+        return str(value)
+
+    def _video_key_value_lines(self, values: dict, keys: list[str]) -> list[str]:
+        lines: list[str] = []
+        for key in keys:
+            if key not in values:
+                continue
+            value = values[key]
+            if isinstance(value, list):
+                value_text = "[" + ", ".join(self._format_video_value(item) for item in value) + "]"
+            else:
+                value_text = self._format_video_value(value)
+            lines.append(f"{key}: {value_text}")
+        return lines
+
+    def _video_integration_lines(self, integration: dict) -> list[str]:
+        mode = str(integration.get("solver_mode", "")).strip()
+        solver = str(integration.get("solver", "")).strip()
+        mode_l = mode.lower()
+
+        if mode_l == "fixed":
+            solver_setup = f"{solver} fixed-step" if solver else "fixed-step"
+        elif mode_l == "adaptive":
+            solver_setup = f"{solver} adaptive" if solver else "adaptive"
+        elif mode_l == "streaming_extrema":
+            solver_setup = f"{solver} fixed-step Stage A; streaming extrema extraction in Stage B"
+        elif mode_l == "rk4_extrema":
+            solver_setup = f"{solver} fixed-step Stage A; CUDA RK4 extrema kernel in Stage B"
+        elif mode_l == "rk4_full_extrema_custom":
+            solver_setup = "generated CUDA RK4 A+B extrema kernel"
+        elif mode_l == "rk4_full_extrema":
+            solver_setup = "optimized CUDA RK4 A+B extrema kernel"
+        else:
+            solver_setup = mode or solver or "unknown"
+
+        lines = [
+            f"device: {self._format_video_value(integration.get('device', ''))}",
+            f"precision: {self._format_video_value(integration.get('precision', ''))}",
+            f"solver setup: {solver_setup}",
+        ]
+        return lines + self._video_key_value_lines(
+            integration,
+            [
+                "period_mode",
+                "custom_time_argument",
+                "period_expression",
+                "transient_periods",
+                "evaluation_periods",
+                "samples_per_period",
+                "t_transient",
+                "t_evaluation",
+                "dt",
+                "save_dt",
+                "streaming_chunk_periods",
+                "abstol",
+                "reltol",
+            ],
+        )
+
+    def _draw_video_text_block(
+        self,
+        draw,
+        title: str,
+        lines: list[str],
+        x: int,
+        y: int,
+        width: int,
+        max_bottom: int,
+    ) -> int:
+        title_font = self._pil_font(18, bold=True)
+        text_font = self._pil_font(15)
+        draw.text((x, y), title, fill="#222222", font=title_font, anchor="la")
+        y += 28
+        for line in lines:
+            if y > max_bottom - 20:
+                break
+            y = self._draw_wrapped_pil_text(draw, x, y, line, text_font, "#333333", width, 4)
+        return y
+
+    def _sweep_video_intro_frame(self, snapshot: dict):
+        frame_w, frame_h = VIDEO_FRAME_SIZE
+        frame = Image.new("RGB", VIDEO_FRAME_SIZE, "white")
+        draw = ImageDraw.Draw(frame)
+        margin = VIDEO_MARGIN
+        title_font = self._pil_font(34, bold=True)
+        subtitle_font = self._pil_font(18)
+        small_font = self._pil_font(15)
+        label_font = self._pil_font(18, bold=True)
+
+        sweep_param = str(snapshot.get("sweep_parameter", "parameter"))
+        sweep = dict(snapshot.get("sweep_config", {}))
+        value_count = len(snapshot.get("details", [])) or sweep.get("num_values", "")
+        sweep_min = sweep.get("min_value", "")
+        sweep_max = sweep.get("max_value", "")
+
+        draw.text((margin, 34), "Basin of attraction parameter sweep", fill="#111111", font=title_font, anchor="la")
+        subtitle = f"{sweep_param}: {self._format_video_value(sweep_min)} to {self._format_video_value(sweep_max)}"
+        if value_count:
+            subtitle += f" | {value_count} values"
+        draw.text((margin, 82), subtitle, fill="#333333", font=subtitle_font, anchor="la")
+
+        run_dir = snapshot.get("run_dir", "")
+        if run_dir:
+            self._draw_wrapped_pil_text(draw, margin, 114, f"Result: {run_dir}", small_font, "#555555", frame_w - 2 * margin, 3)
+
+        content_top = 162
+        left_x = margin
+        right_x = frame_w // 2 + 18
+        column_w = frame_w // 2 - margin - 42
+        bottom = frame_h - 42
+
+        draw.text((left_x, content_top), "Model equations", fill="#222222", font=label_font, anchor="la")
+        y_left = self._paste_latex_equations(frame, snapshot, left_x, content_top + 34, column_w, content_top + 250)
+
+        parameter_names = list(snapshot.get("parameter_names", []))
+        parameter_values = list(snapshot.get("parameter_values", []))
+        parameter_lines: list[str] = []
+        for idx, name in enumerate(parameter_names):
+            value = parameter_values[idx] if idx < len(parameter_values) else ""
+            if str(name) == sweep_param and sweep_min != "":
+                parameter_lines.append(f"{name}: sweep {self._format_video_value(sweep_min)} to {self._format_video_value(sweep_max)}")
+            else:
+                parameter_lines.append(f"{name}: {self._format_video_value(value)}")
+        self._draw_video_text_block(draw, "Model parameters", parameter_lines, left_x, max(y_left + 26, content_top + 292), column_w, bottom)
+
+        integration = dict(snapshot.get("integration_config", {}))
+        integration_lines = self._video_integration_lines(integration)
+
+        output = dict(snapshot.get("output_config", {}))
+        classification = dict(snapshot.get("classification_config", {}))
+        extra_lines = self._video_key_value_lines(
+            classification,
+            ["observable_state", "zero_cross_state", "fingerprint_tol", "fingerprint_k", "extrema_eps", "max_extrema"],
+        )
+        if output:
+            extra_lines.extend(self._video_key_value_lines(output, ["run_name", "write_sweep_details"]))
+
+        y_right = self._draw_video_text_block(draw, "Integration", integration_lines, right_x, content_top, column_w, bottom)
+        if extra_lines:
+            self._draw_video_text_block(draw, "Classification / output", extra_lines, right_x, min(y_right + 30, bottom - 180), column_w, bottom)
+
+        draw.line([(0, frame_h - 1), (frame_w, frame_h - 1)], fill="#dddddd", width=1)
+        return frame
+
     def _current_result_config(self) -> dict:
         if self.current_result_dir is None:
             return {}
@@ -3519,6 +3831,10 @@ class BasinGuiApp(tk.Tk):
         summary_model = summary.get("model", {})
         config_model = config.get("model", {}) if config else {}
         model = {**summary_model, **config_model}
+        sweep_config = config.get("sweep", {}) if config else {}
+        integration_config = {**(config.get("integration", {}) if config else {}), **summary.get("integration", {})}
+        classification_config = config.get("classification", {}) if config else {}
+        output_config = config.get("output", {}) if config else {}
         plane = {**(config.get("initial_condition_plane", {}) if config else {}), **summary.get("initial_condition_plane", {})}
         classification = config.get("classification", {}) if config else {}
         plane_x = str(plane.get("x_state", "x"))
@@ -3531,11 +3847,18 @@ class BasinGuiApp(tk.Tk):
             "sweep_points": [dict(point) for point in self.sweep_points],
             "sweep_bounds": self.sweep_bounds,
             "sweep_feature_colors_by_value": {float(value): dict(colors) for value, colors in self.sweep_feature_colors_by_value.items()},
+            "sweep_class_fractions_by_value": {float(value): dict(fractions) for value, fractions in self.sweep_class_fractions_by_value.items()},
             "result_plane_bounds": self.result_plane_bounds,
             "feature_mode": self._uses_feature_colors(),
             "point_radius": self._sweep_point_radius(),
             "filter_values": self._sweep_filter_values(),
+            "phase_min_fraction": self._phase_min_fraction(),
             "zoom_views": dict(self.zoom_views),
+            "run_dir": str(summary.get("run", {}).get("run_dir", "")),
+            "sweep_config": sweep_config,
+            "integration_config": integration_config,
+            "classification_config": classification_config,
+            "output_config": output_config,
             "sweep_parameter": sweep_parameter,
             "plane_x_state": plane_x,
             "plane_y_state": plane_y,
@@ -3561,6 +3884,8 @@ class BasinGuiApp(tk.Tk):
         feature_colors = self._feature_colors_for_sweep_value_map(snapshot["sweep_feature_colors_by_value"], value)
         rows = self._load_label_rows(detail["labels_csv"])
         series, phase_bounds = self._load_phase_series(detail["phase_samples_csv"])
+        class_fractions = self._class_fractions_for_sweep_value_map(snapshot.get("sweep_class_fractions_by_value", {}), value)
+        self._annotate_phase_series(series, class_fractions)
 
         basin_image = self._render_basin_image(
             panel_side,
@@ -3585,6 +3910,7 @@ class BasinGuiApp(tk.Tk):
             feature_mode=snapshot["feature_mode"],
             x_label=snapshot.get("phase_x_state", "x"),
             y_label=snapshot.get("phase_y_state", "v"),
+            min_fraction=float(snapshot.get("phase_min_fraction", 0.0)),
         )
         sweep_image = self._render_sweep_image_from_data(
             panel_side,
@@ -3641,11 +3967,18 @@ class BasinGuiApp(tk.Tk):
             if not writer.isOpened():
                 raise RuntimeError(f"Could not open video writer for: {path}")
 
-            total = len(details)
+            total = VIDEO_INTRO_FRAMES + len(details)
+            intro_frame = self._sweep_video_intro_frame(snapshot)
+            intro_bgr = cv2.cvtColor(np.array(intro_frame), cv2.COLOR_RGB2BGR)
+            for intro_idx in range(1, VIDEO_INTRO_FRAMES + 1):
+                writer.write(intro_bgr)
+                if intro_idx == VIDEO_INTRO_FRAMES or intro_idx % VIDEO_FPS == 0:
+                    progress_queue.put(("progress", intro_idx, total))
+
             for idx, detail in enumerate(details, start=1):
                 frame = self._sweep_video_frame_from_snapshot(snapshot, detail)
                 writer.write(cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR))
-                progress_queue.put(("progress", idx, total))
+                progress_queue.put(("progress", VIDEO_INTRO_FRAMES + idx, total))
             writer.release()
             writer = None
             progress_queue.put(("done", str(path), total, total / VIDEO_FPS))
@@ -3714,9 +4047,10 @@ class BasinGuiApp(tk.Tk):
             return
 
         progress_queue: queue.Queue = queue.Queue()
-        progress_window, progress_bar, status_label = self._create_video_progress_dialog(len(details), path)
+        total_frames = VIDEO_INTRO_FRAMES + len(details)
+        progress_window, progress_bar, status_label = self._create_video_progress_dialog(total_frames, path)
         self._append_log(
-            f"Exporting sweep video in background: {path} | frames={len(details)}, fps={VIDEO_FPS}, duration={len(details) / VIDEO_FPS:.2f}s"
+            f"Exporting sweep video in background: {path} | frames={total_frames}, intro={VIDEO_INTRO_SECONDS}s, fps={VIDEO_FPS}, duration={total_frames / VIDEO_FPS:.2f}s"
         )
         thread = threading.Thread(
             target=self._export_sweep_video_worker,

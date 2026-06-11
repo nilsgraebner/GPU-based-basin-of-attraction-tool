@@ -918,7 +918,7 @@ function check_generic_rk4_inputs(u_list, pvec, dt, save_dt, max_extrema::Int, l
     CUDA.functional() || error("CUDA is not functional, so the $label run is not possible.")
     isempty(u_list) && return 0
     T = eltype(u_list[1])
-    T == Float32 || error("$label currently supports Float32 only.")
+    T in (Float32, Float64) || error("$label currently supports Float32 and Float64 only.")
     nstates = length(u_list[1])
     2 <= nstates <= 8 || error("$label currently supports 2 to 8 states.")
     max_extrema >= 1 || error("classification.max_extrema must be at least 1 for $label.")

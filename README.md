@@ -19,23 +19,29 @@ The GUI can display and export:
 - Basin maps with rectangle zoom and optional recomputation of the selected region.
 - Phase portraits of representative trajectories.
 - Sweep plots of extrema over a varied parameter.
+- Loading of previous result folders through saved `summary.toml` files.
 - Image exports of the current plots.
-- Sweep videos showing basin map, phase portrait, and sweep overview along the swept parameter.
+- Sweep videos showing basin map, phase portrait, and sweep overview along the swept parameter. Exported videos include a short intro page with model equations, parameters, and integration settings.
+
+## Example Videos
+
+- [Bistable Duffing oscillator sweep](https://youtu.be/6RrQ9ALEsMU)
+- [Bistable nonlinear energy harvester sweep](https://youtu.be/gjpNIxjhMkw)
 
 ## Numerical Workflow
 
 For each initial condition, the backend uses a two-stage workflow:
 
-1. **Stage A, transient integration**  
+1. **Stage A, transient integration**
    The trajectory is integrated until the configured transient time. The final state is used as the starting point for the steady-state evaluation.
 
-2. **Stage B, evaluation window**  
+2. **Stage B, evaluation window**
    The trajectory is integrated for a fixed number of evaluation periods. Extrema of the selected observable are extracted from sign changes of a selected zero-crossing state.
 
-3. **Fingerprint classification**  
+3. **Fingerprint classification**
    The detected extrema are quantized with `fingerprint_tol`, sorted, truncated to `fingerprint_k`, and used as a response fingerprint. Initial conditions with the same fingerprint receive the same basin label.
 
-4. **Visualization and export**  
+4. **Visualization and export**
    Basin labels, representative phase trajectories, class statistics, extrema rows, and summary metadata are written to the run folder.
 
 More details on the implementation are documented in [docs/ALGORITHMS.md](docs/ALGORITHMS.md).
@@ -44,22 +50,25 @@ More details on the implementation are documented in [docs/ALGORITHMS.md](docs/A
 
 The GUI exposes solver setups as curated combinations rather than independent low-level options.
 
-- **GPU fast - Float32 fixed Tsit5**  
+- **GPU fast - Float32 fixed Tsit5**
   Fixed-step GPU integration using `DiffEqGPU` and `OrdinaryDiffEq`.
 
-- **GPU memory saver - Float32 streaming extrema**  
+- **GPU accurate - Float64 fixed Tsit5**
+  Fixed-step GPU integration with Float64 for precision checks on GPUs that support double precision.
+
+- **GPU memory saver - Float32 streaming extrema**
   Keeps Stage A unchanged, then processes Stage B in chunks and stores only extrema instead of full trajectories.
 
-- **GPU RK4 extrema Stage B - Float32**  
+- **GPU RK4 extrema Stage B - Float32**
   Uses GPU Tsit5 for Stage A and a fused CUDA RK4 kernel for Stage B extrema detection.
 
-- **GPU RK4 extrema Stage A+B - Float32**  
-  Uses custom CUDA RK4 kernels for both transient integration and extrema detection for the built-in Duffing model.
+- **GPU RK4 extrema Stage A+B Custom - Float32**
+  Generates specialized CUDA RK4 kernels from validated ODE expressions, including the standard Duffing model. For periodic forcing written as `cos(w*t)`, this setup uses the wrapped phase form automatically when `period_expression = 2*pi/w`.
 
-- **GPU RK4 extrema Stage A+B Custom - Float32**  
-  Generates specialized CUDA RK4 kernels from validated custom ODE expressions.
+- **GPU RK4 extrema Stage A+B Custom - Float64**
+  Uses the same generated all-RK4 CUDA path with Float64 state integration.
 
-- **CPU fixed/adaptive modes**  
+- **CPU fixed/adaptive modes**
   CPU fallbacks and reference modes based on `OrdinaryDiffEq`, including Tsit5, Vern9, Rosenbrock23, and Rodas5P.
 
 ## Model Input
@@ -73,7 +82,20 @@ The model is entered as one right-hand side expression per state variable. Expre
 
 The expression validator rejects arrays, indexing, assignments, arbitrary Julia code, random numbers, and file access. This keeps custom models compatible with code generation and GPU execution.
 
-In custom RK4 phase mode, equations can remain in the familiar form `cos(w*t)` when the period expression is `2*pi/w`; internally, the product `w*t` is replaced by the wrapped forcing phase.
+In custom RK4 phase mode, equations can remain in the familiar form `cos(w*t)` when the period expression is `2*pi/w`; internally, the product `w*t` is replaced by the wrapped forcing phase. Periodic custom Stage A+B RK4 runs enable this phase form automatically when the rewrite is safe.
+
+Phase plots can be filtered by minimum class fraction after results have been loaded. This redraws the saved representative trajectories and also applies to sweep video export; it does not rerun the integrations.
+
+## Recent Update
+
+This release update adds:
+
+- A **Load Results** workflow for opening arbitrary previous result summaries.
+- Minimum class-fraction filtering for phase portraits and sweep video export.
+- Improved representative phase-trajectory selection based on the most frequent classes.
+- GPU Float64 solver setups for fixed-step Tsit5 and generated custom RK4 Stage A+B runs.
+- A unified generated custom RK4 Stage A+B solver that also supports the standard Duffing configuration.
+- Sweep video intros containing model equations, model parameters, solver setup, and integration/classification settings.
 
 ## Repository Contents
 

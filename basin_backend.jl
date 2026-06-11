@@ -285,6 +285,34 @@ function runtime_equations_for_custom_time_argument(equations::Vector{String}, p
 end
 
 
+function select_runtime_custom_time_argument(equations::Vector{String}, param_names::Vector{String}, integration_cfg::Dict{String, Any}, solver_mode::String)
+    configured = get_custom_time_argument(integration_cfg)
+    configured == "phase" && return configured, integration_cfg, false
+
+    if lowercase(solver_mode) == "rk4_full_extrema_custom" &&
+       lowercase(String(get(integration_cfg, "period_mode", ""))) == "periodic"
+        phase_cfg = copy(integration_cfg)
+        phase_cfg["custom_time_argument"] = "phase"
+
+        if equations_use_symbol(equations, :phase)
+            return "phase", phase_cfg, true
+        end
+
+        try
+            phase_equations = runtime_equations_for_custom_time_argument(equations, param_names, phase_cfg)
+            if normalize_expr_string.(phase_equations) != normalize_expr_string.(equations)
+                return "phase", phase_cfg, true
+            end
+        catch
+            # Keep the explicit time mode when the model contains physical time
+            # terms that cannot be rewritten to a wrapped forcing phase.
+        end
+    end
+
+    return configured, integration_cfg, false
+end
+
+
 function typed_numeric_literals_expr(expr)
     if expr isa Bool
         return expr
@@ -356,13 +384,17 @@ function build_ode_function(state_names::Vector{String}, param_names::Vector{Str
 end
 
 
-function get_model_function(state_names::Vector{String}, param_names::Vector{String}, equations::Vector{String}, device::String)
-    if matches_default_duffing(state_names, param_names, equations)
+function get_model_function(state_names::Vector{String}, param_names::Vector{String}, equations::Vector{String}, device::String; force_custom::Bool=false)
+    if !force_custom && matches_default_duffing(state_names, param_names, equations)
         println("Model path: built-in Duffing model")
         return default_duffing, false
     end
 
-    println("Model path: custom equations (generated GPU-safe Julia function)")
+    if force_custom && matches_default_duffing(state_names, param_names, equations)
+        println("Model path: standard Duffing equations through generated custom model")
+    else
+        println("Model path: custom equations (generated GPU-safe Julia function)")
+    end
     return build_ode_function(state_names, param_names, equations), true
 end
 
@@ -978,22 +1010,35 @@ const PHASE_BINARY_MAGIC = UInt8[0x42, 0x41, 0x53, 0x50, 0x48, 0x30, 0x31, 0x00]
 
 
 function select_phase_sample_indices(labels_vec::Vector{Int32}; max_labels::Int=20, samples_per_label::Int=5)
-    counts = Dict{Int32, Int}()
+    label_indices = Dict{Int32, Vector{Int}}()
     selected = Tuple{Int32, Int32, Int}[]
 
     for i in eachindex(labels_vec)
         label = labels_vec[i]
-        if label <= 0 || Int(label) > max_labels
+        if label <= 0
             continue
         end
+        push!(get!(label_indices, label, Int[]), i)
+    end
 
-        current_count = get(counts, label, 0)
-        if current_count >= samples_per_label
-            continue
+    ranked_labels = sort(collect(keys(label_indices)); by=label -> (-length(label_indices[label]), Int(label)))
+    for label in Iterators.take(ranked_labels, max_labels)
+        indices = label_indices[label]
+        n_pick = min(samples_per_label, length(indices))
+        n_pick <= 0 && continue
+
+        used_positions = Set{Int}()
+        for pick in 1:n_pick
+            pos = n_pick == 1 ? 1 : round(Int, 1 + (pick - 1) * (length(indices) - 1) / (n_pick - 1))
+            while pos in used_positions && pos < length(indices)
+                pos += 1
+            end
+            while pos in used_positions && pos > 1
+                pos -= 1
+            end
+            push!(used_positions, pos)
+            push!(selected, (Int32(length(selected) + 1), label, indices[pos]))
         end
-
-        counts[label] = current_count + 1
-        push!(selected, (Int32(length(selected) + 1), label, i))
     end
     return selected
 end
@@ -1396,9 +1441,6 @@ function solve_single_trajectory(
         length(u0) <= 8 || error("$solver_mode_l point probes currently support at most 8 states.")
         if solver_mode_l == "rk4_full_extrema" && odefun !== default_duffing
             error("rk4_full_extrema is the optimized built-in Duffing RK4 A+B path. Use rk4_full_extrema_custom for custom models.")
-        end
-        if solver_mode_l == "rk4_full_extrema_custom" && odefun === default_duffing
-            error("rk4_full_extrema_custom is intended for custom models. Use rk4_full_extrema for the built-in Duffing model.")
         end
         if solver_mode_l in ("rk4_full_extrema", "rk4_full_extrema_custom")
             if odefun === default_duffing
@@ -1867,7 +1909,11 @@ function compute_operating_point(
 
     if rk4_extrema || rk4_full_extrema_any
         device == "gpu" || error("$solver_mode_l currently supports GPU runs only.")
-        precision == Float32 || error("$solver_mode_l currently supports Float32 only.")
+        if rk4_extrema || rk4_full_extrema
+            precision == Float32 || error("$solver_mode_l currently supports Float32 only.")
+        elseif rk4_full_extrema_custom
+            precision in (Float32, Float64) || error("$solver_mode_l currently supports Float32 and Float64 only.")
+        end
         lowercase(solver_name) == "tsit5" || error("$solver_mode_l currently requires solver = Tsit5.")
         nstates_rk4 = length(u0_list[1])
         2 <= nstates_rk4 <= 8 || error("$solver_mode_l currently supports 2 to 8 states.")
@@ -1875,7 +1921,6 @@ function compute_operating_point(
             error("rk4_full_extrema is the optimized built-in Duffing RK4 A+B path. Use rk4_full_extrema_custom for custom models.")
         end
         if rk4_full_extrema_custom
-            odefun !== default_duffing || error("rk4_full_extrema_custom is intended for custom models. Use rk4_full_extrema for the built-in Duffing model.")
             !isempty(state_names) || error("rk4_full_extrema_custom requires state_names.")
             !isempty(runtime_model_equations) || error("rk4_full_extrema_custom requires model equations.")
             if custom_time_argument == "phase"
@@ -2437,7 +2482,13 @@ function run_config(config_path::String)
     device = lowercase(String(integration_cfg["device"]))
     solver_mode = String(integration_cfg["solver_mode"])
     solver_name = String(integration_cfg["solver"])
-    custom_time_argument = get_custom_time_argument(integration_cfg)
+    configured_custom_time_argument = get_custom_time_argument(integration_cfg)
+    custom_time_argument, integration_cfg, custom_time_argument_auto = select_runtime_custom_time_argument(
+        equations,
+        param_names,
+        integration_cfg,
+        solver_mode,
+    )
     abstol = precision(integration_cfg["abstol"])
     reltol = precision(integration_cfg["reltol"])
     max_extrema = Int(class_cfg["max_extrema"])
@@ -2459,6 +2510,9 @@ function run_config(config_path::String)
         lowercase(solver_mode) == "rk4_full_extrema_custom" || error("integration.custom_time_argument = 'phase' is currently supported only by solver_mode = 'rk4_full_extrema_custom'.")
         lowercase(String(integration_cfg["period_mode"])) == "periodic" || error("integration.custom_time_argument = 'phase' requires integration.period_mode = 'periodic'.")
     end
+    if custom_time_argument_auto
+        println("Custom time argument: using wrapped phase automatically for periodic custom RK4 A+B.")
+    end
 
     runtime_equations = runtime_equations_for_custom_time_argument(equations, param_names, integration_cfg)
     if custom_time_argument == "phase" && normalize_expr_string.(runtime_equations) != normalize_expr_string.(equations)
@@ -2466,7 +2520,8 @@ function run_config(config_path::String)
         println("Custom time argument: replacing $(frequency_symbol)*t by wrapped phase internally.")
     end
 
-    odefun, uses_dynamic_model = get_model_function(state_names, param_names, runtime_equations, device)
+    force_custom_model = lowercase(solver_mode) == "rk4_full_extrema_custom"
+    odefun, uses_dynamic_model = get_model_function(state_names, param_names, runtime_equations, device; force_custom=force_custom_model)
     u0_list = generate_initial_conditions(state_defaults, x_idx, y_idx, xs, ys)
 
     started = time()
@@ -2582,6 +2637,8 @@ function run_config(config_path::String)
                 "solver" => solver_name,
                 "precision" => String(integration_cfg["precision"]),
                 "custom_time_argument" => custom_time_argument,
+                "configured_custom_time_argument" => configured_custom_time_argument,
+                "custom_time_argument_auto" => custom_time_argument_auto,
                 "dt" => Float64(dt_probe),
                 "save_dt" => Float64(save_dt_probe),
                 "period" => Float64(period),
@@ -2832,6 +2889,8 @@ function run_config(config_path::String)
                 "solver" => solver_name,
                 "precision" => String(integration_cfg["precision"]),
                 "custom_time_argument" => custom_time_argument,
+                "configured_custom_time_argument" => configured_custom_time_argument,
+                "custom_time_argument_auto" => custom_time_argument_auto,
             ),
             "optimization" => Dict(
                 "batch_sweep_transient_requested" => batch_transient_requested,
@@ -2963,6 +3022,8 @@ function run_config(config_path::String)
             "solver" => solver_name,
             "precision" => String(integration_cfg["precision"]),
             "custom_time_argument" => custom_time_argument,
+            "configured_custom_time_argument" => configured_custom_time_argument,
+            "custom_time_argument_auto" => custom_time_argument_auto,
             "dt" => Float64(result.dt),
             "save_dt" => Float64(result.save_dt),
             "t_transient" => Float64(result.t_transient),
